@@ -931,6 +931,157 @@ class GaPowerApi:
             )
         return inner
 
+    async def async_get_daily(
+        self,
+        start: dt.date,
+        last_day: dt.date,
+        periods: list[tuple[dt.date, dt.date]] | None = None,
+    ) -> dict[dt.datetime, dict[str, float]]:
+        """Daily usage/cost between two dates, inclusive of `last_day`.
+
+        The fallback for accounts whose /Hourly route answers hasData=false for every
+        window - observed on an Alabama Power account 2026-11-17, where the portal
+        itself offers only Daily and Monthly. Same host, bearer and parameters as
+        /Hourly; only the last path segment differs (captured from the portal's own
+        Daily chart on 2026-11-17).
+
+        The portal asks for one BILL PERIOD per Daily request, so this does too when
+        the periods are known, and falls back to CHUNK_DAYS windows when they are not.
+
+        Returns {naive local midnight: {"kwh":, "cost":, "temp_high":, "temp_low":}}.
+        """
+        windows: list[tuple[dt.date, dt.date]] = []  # (start, end EXCLUSIVE)
+        if periods:
+            for p_start, p_end in periods:
+                if p_end <= start or p_start > last_day:
+                    continue
+                windows.append((p_start, p_end))
+        if not windows:
+            cursor = start
+            while cursor <= last_day:
+                chunk_last = min(cursor + dt.timedelta(days=CHUNK_DAYS - 1), last_day)
+                windows.append((cursor, chunk_last + dt.timedelta(days=1)))
+                cursor = chunk_last + dt.timedelta(days=1)
+
+        out: dict[dt.datetime, dict[str, float]] = {}
+        for i, (w_start, w_end) in enumerate(windows):
+            if i:
+                await asyncio.sleep(REQUEST_DELAY)
+            parsed = await self._fetch_daily(w_start, w_end)
+            if parsed:
+                _merge_daily(parsed, out)
+        # Keep only the days that were asked for; a bill period can start before
+        # `start` or run past today.
+        return {
+            ts: vals for ts, vals in out.items() if start <= ts.date() <= last_day
+        }
+
+    async def _fetch_daily(self, start: dt.date, end_exclusive: dt.date) -> dict | None:
+        params = {
+            "accountId": self.account,
+            "personId": self.person_id,
+            "operatingCompany": self.company,
+            "startDate": start.strftime("%m/%d/%Y"),
+            # Same exclusive end as /Hourly: the portal sends the NEXT period's start.
+            "endDate": end_exclusive.strftime("%m/%d/%Y"),
+            "servicePointId": self.service_point,
+            "premiseId": self.premise_id,
+            "billFactorCode": "null",
+            "intervalBehavior": "Automatic",
+        }
+        payload = await self._get_json(
+            f"{USAGE_API}/MyPowerUsage/UsageGraphData/{self.service_agreement}/Daily",
+            "UsageGraphData/Daily",
+            params=params,
+        )
+        data = payload.get("data") or {}
+        if not data.get("hasData"):
+            _LOGGER.debug("No daily data for %s .. %s (end exclusive)", start, end_exclusive)
+            return None
+        inner = data.get("data")
+        if isinstance(inner, str):
+            try:
+                inner = json.loads(inner)
+            except ValueError:
+                return None
+        if not isinstance(inner, dict):
+            return None
+        _LOGGER.debug(
+            "daily %s..%s: series %s",
+            start, end_exclusive, sorted(_series_map(inner).keys()),
+        )
+        return inner
+
+
+def _series_map(parsed: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """{series name: [points]} from either shape the portal has used.
+
+    /Hourly returns `series` as an object keyed by name, each with a `data` list. The
+    Daily capture described it as a list of points per name; accept both, plus a list
+    of {name|id, data} objects, so a shape change in either direction still parses.
+    """
+    series = parsed.get("series") or {}
+    out: dict[str, list[dict[str, Any]]] = {}
+    if isinstance(series, dict):
+        for name, val in series.items():
+            pts = val.get("data") if isinstance(val, dict) else val
+            if isinstance(pts, list):
+                out[str(name)] = [p for p in pts if isinstance(p, dict)]
+    elif isinstance(series, list):
+        for item in series:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name") or item.get("id")
+            pts = item.get("data")
+            if name and isinstance(pts, list):
+                out[str(name)] = [p for p in pts if isinstance(p, dict)]
+    return out
+
+
+# Daily series -> field. Weekday and weekend are separate series that never overlap
+# on the same day, so they are SUMMED per day into one value. `usage`/`cost` cover a
+# response that ever stops splitting them.
+_DAILY_SERIES = {
+    "weekdayusage": "kwh",
+    "weekendusage": "kwh",
+    "usage": "kwh",
+    "weekdaycost": "cost",
+    "weekendcost": "cost",
+    "cost": "cost",
+    "hightemp": "temp_high",
+    "lowtemp": "temp_low",
+}
+
+
+def _merge_daily(parsed: dict[str, Any], acc: dict[dt.datetime, dict[str, float]]) -> None:
+    labels = (parsed.get("xAxis") or {}).get("labels") or []
+    smap = _series_map(parsed)
+    split = any(n.lower().startswith(("weekday", "weekend")) for n in smap)
+    for name, pts in smap.items():
+        field = _DAILY_SERIES.get(name.lower())
+        if field is None:
+            continue
+        if split and name.lower() in ("usage", "cost"):
+            continue  # already counted through the weekday/weekend split
+        for pt in pts:
+            y = pt.get("y")
+            if y is None or y == SENTINEL:
+                continue
+            ts = _parse_ts(pt)
+            if ts is None:
+                # Fall back to the x-axis label at this point's index.
+                x = pt.get("x")
+                if isinstance(x, int) and 0 <= x < len(labels):
+                    ts = _parse_ts({"name": labels[x]})
+            if ts is None:
+                continue
+            day = dt.datetime.combine(ts.date(), dt.time())
+            vals = acc.setdefault(day, {})
+            if field in ("kwh", "cost"):
+                vals[field] = vals.get(field, 0.0) + float(y)
+            else:
+                vals[field] = float(y)
+
 
 def _parse_ts(pt: dict[str, Any]) -> dt.datetime | None:
     """Points carry a naive local ISO timestamp in `name`.

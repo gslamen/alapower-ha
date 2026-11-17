@@ -139,6 +139,40 @@ def _projection(
     }
 
 
+_UTILITY_NAMES = {
+    "GPC": "Georgia Power",
+    "APC": "Alabama Power",
+    "MPC": "Mississippi Power",
+}
+
+
+def _daily_cycle(
+    daily: dict[dt.datetime, dict[str, float]],
+    cycle: tuple[dt.date, dt.date] | None,
+    tz: ZoneInfo,
+    today: dt.date,
+) -> dict[str, Any]:
+    """The cycle fields that daily data CAN support.
+
+    Cycle dates, kWh so far and how fresh the data is. The peak hour, demand charge
+    and TOU-RD bill projection need hourly readings (and the projection is Georgia
+    Power's tariff), so they stay None rather than show a wrong number.
+    """
+    out: dict[str, Any] = dict.fromkeys(_DEMAND_KEYS)
+    if cycle is None:
+        return out
+    start, end = cycle
+    out["cycle_start"] = dt.datetime.combine(start, dt.time(), tzinfo=tz)
+    out["cycle_end"] = dt.datetime.combine(end, dt.time(), tzinfo=tz)
+    out["cycle_length"] = (end - start).days
+    out["cycle_day"] = (min(today, end - dt.timedelta(days=1)) - start).days + 1
+    days = [ts for ts in daily if start <= ts.date() < end and "kwh" in daily[ts]]
+    if days:
+        out["cycle_kwh"] = round(sum(daily[ts]["kwh"] for ts in days), 2)
+        out["data_through"] = max(days).replace(tzinfo=tz)
+    return out
+
+
 class GaPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Pull hourly usage and push it into the recorder's statistics tables."""
 
@@ -174,6 +208,10 @@ class GaPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # stale one.
         self._periods: list[tuple[dt.date, dt.date]] = []
         self._cycle: tuple[dt.date, dt.date] | None = None
+        # Set once /Hourly has come back empty while /Daily had data (Alabama Power
+        # accounts without interval data). Skips the pointless hourly requests on
+        # every later poll; cleared on restart so a meter upgrade is picked up.
+        self._daily_only = False
 
     @property
     def _usage_id(self) -> str:
@@ -385,10 +423,24 @@ class GaPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "Resuming from %s (baseline %.1f kWh / $%.2f)", since, base_kwh, base_cost
             )
 
-        hourly = await self.api.async_get_hourly(start_date, today)
+        hourly: dict[dt.datetime, dict[str, float]] = {}
+        if not self._daily_only:
+            hourly = await self.api.async_get_hourly(start_date, today)
+        daily_mode = False
         if not hourly:
-            _LOGGER.debug("No hourly rows returned for %s .. %s", start_date, today)
-            return self.data or {}
+            _LOGGER.debug(
+                "No hourly rows for %s .. %s; trying daily", start_date, today
+            )
+            hourly = await self.api.async_get_daily(start_date, today, self._periods)
+            if not hourly:
+                _LOGGER.debug("No daily rows returned either")
+                return self.data or {}
+            if not self._daily_only:
+                _LOGGER.info(
+                    "Hourly data is not available for this account; importing daily "
+                    "usage and cost instead (one row per day, at midnight)"
+                )
+            self._daily_only = daily_mode = True
 
         usage_stats: list[StatisticData] = []
         cost_stats: list[StatisticData] = []
@@ -414,12 +466,13 @@ class GaPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 latest_cost = vals["cost"]
 
+        utility = _UTILITY_NAMES.get(str(self.api.company or "").upper(), "Georgia Power")
         if usage_stats:
             async_add_external_statistics(
                 self.hass,
                 self._metadata(
                     self._usage_id,
-                    "Georgia Power Energy Consumption",
+                    f"{utility} Energy Consumption",
                     UnitOfEnergy.KILO_WATT_HOUR,
                     # EnergyConverter.UNIT_CLASS in homeassistant/util/unit_conversion.py
                     unit_class="energy",
@@ -431,7 +484,7 @@ class GaPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.hass,
                 self._metadata(
                     self._cost_id,
-                    "Georgia Power Energy Cost",
+                    f"{utility} Energy Cost",
                     self.hass.config.currency,
                     # Money has no unit converter, so no unit class - same as core's
                     # opower integration, which passes unit_class=None for cost.
@@ -447,10 +500,16 @@ class GaPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "latest_cost": latest_cost,
             "total_kwh": round(running_kwh, 3),
             "imported": len(usage_stats),
+            "resolution": "daily" if daily_mode else "hourly",
             # Computed from `hourly` rather than from the statistics just written:
             # same numbers, no read-back, and it stays correct even on a run where
-            # nothing needed importing.
-            **self._demand(hourly, cycle, tz, today),
+            # nothing needed importing. Daily rows cannot give an hourly peak, so the
+            # demand charge and the TOU bill projection are left blank in daily mode.
+            **(
+                _daily_cycle(hourly, cycle, tz, today)
+                if daily_mode
+                else self._demand(hourly, cycle, tz, today)
+            ),
         }
 
     def _metadata(
