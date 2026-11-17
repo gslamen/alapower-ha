@@ -496,6 +496,142 @@ check("...and where it is in the cycle",
       (attrs["cycle_day"], attrs["cycle_length"]), (6, 32))
 check("no attribute is missing", [k for k, v in attrs.items() if v is None], [])
 
+print("\n--- daily fallback (Alabama Power accounts without hourly data)")
+
+# Shape from the 2026-11-17 capture of the portal's own Daily chart: weekday and
+# weekend kWh/cost are separate series, dates in each point's `name`.
+_daily_payload = {
+    "xAxis": {"labels": ["2026-10-15T00:00:00", "2026-10-16T00:00:00",
+                         "2026-10-17T00:00:00"]},
+    "series": {
+        "weekdayUsage": {"data": [
+            {"x": 0, "y": 101, "name": "2026-10-15T00:00:00", "resolution": "daily"},
+            {"x": 1, "y": 70, "name": "2026-10-16T00:00:00", "resolution": "daily"},
+        ]},
+        "weekendUsage": {"data": [
+            {"x": 2, "y": 33, "name": "2026-10-17T00:00:00", "resolution": "daily"},
+        ]},
+        "weekdayCost": {"data": [
+            {"x": 0, "y": 29.84, "name": "2026-10-15T00:00:00"},
+            {"x": 1, "y": 20.68, "name": "2026-10-16T00:00:00"},
+        ]},
+        "weekendCost": {"data": [{"x": 2, "y": 9.75, "name": "2026-10-17T00:00:00"}]},
+        "highTemp": {"data": [{"x": 0, "y": 90, "name": "2026-10-15T00:00:00"}]},
+        "lowTemp": {"data": [{"x": 0, "y": 63, "name": "2026-10-15T00:00:00"}]},
+        "usageDelayed": {"data": []},
+    },
+}
+_acc = {}
+gapi._merge_daily(_daily_payload, _acc)
+_d15, _d17 = dt.datetime(2026, 10, 15), dt.datetime(2026, 10, 17)
+check("daily: one row per day", len(_acc), 3)
+check("daily: weekday kWh + cost", (_acc[_d15]["kwh"], _acc[_d15]["cost"]), (101.0, 29.84))
+check("daily: weekend day comes from the weekend series",
+      (_acc[_d17]["kwh"], _acc[_d17]["cost"]), (33.0, 9.75))
+check("daily: temps kept", (_acc[_d15]["temp_high"], _acc[_d15]["temp_low"]), (90.0, 63.0))
+check("daily: rows sit at local midnight", all(t.hour == 0 for t in _acc), True)
+
+# List-shaped series, and points with no `name` (date from the x-axis label).
+_list_payload = {
+    "xAxis": {"labels": ["2026-10-15T00:00:00", "2026-10-16T00:00:00"]},
+    "series": [
+        {"name": "weekdayUsage", "data": [{"x": 0, "y": 10}, {"x": 1, "y": -1}]},
+        {"name": "usage", "data": [{"x": 0, "y": 999}]},
+    ],
+}
+_acc2 = {}
+gapi._merge_daily(_list_payload, _acc2)
+check("daily: list-shaped series and label fallback", _acc2[_d15]["kwh"], 10.0)
+check("daily: -1 placeholder skipped", dt.datetime(2026, 10, 16) in _acc2, False)
+check("daily: combined `usage` not double-counted with the split", len(_acc2), 1)
+
+
+class _FakeDailyApi(gapi.GaPowerApi):
+    def __init__(self):
+        self.calls = []
+
+    async def _fetch_daily(self, start, end_exclusive):
+        self.calls.append((start, end_exclusive))
+        return _daily_payload
+
+
+async def _run_daily():
+    api = _FakeDailyApi()
+    gapi.REQUEST_DELAY = 0
+    periods = [(D(2026, 9, 15), D(2026, 10, 15)), (D(2026, 10, 15), D(2026, 11, 12)),
+               (D(2026, 11, 12), D(2026, 12, 14))]
+    got = await api.async_get_daily(D(2026, 10, 16), D(2026, 11, 17), periods)
+    return api.calls, got
+
+
+_calls, _got = asyncio.run(_run_daily())
+check("daily: one request per overlapping bill period",
+      _calls, [(D(2026, 10, 15), D(2026, 11, 12)), (D(2026, 11, 12), D(2026, 12, 14))])
+check("daily: days before `start` dropped", sorted(_got),
+      [dt.datetime(2026, 10, 16), dt.datetime(2026, 10, 17)])
+
+_dc = gcoord._daily_cycle(
+    {dt.datetime(2026, 11, 12): {"kwh": 40.0}, dt.datetime(2026, 11, 13): {"kwh": 35.5},
+     dt.datetime(2026, 11, 11): {"kwh": 99.0}},
+    (D(2026, 11, 12), D(2026, 12, 14)), TZ, D(2026, 11, 17),
+)
+check("daily cycle: kWh only from this cycle", _dc["cycle_kwh"], 75.5)
+check("daily cycle: day 6 of 32", (_dc["cycle_day"], _dc["cycle_length"]), (6, 32))
+check("daily cycle: no fake demand figures",
+      (_dc["cycle_peak"], _dc["demand_charge"], _dc["bill_projection"]), (None, None, None))
+check("utility name for Alabama Power", gcoord._UTILITY_NAMES["APC"], "Alabama Power")
+
+
+class _HourlyEmptyApi:
+    company = "APC"
+
+    def __init__(self):
+        self.hourly_calls = 0
+
+    async def async_get_hourly(self, start, last_day):
+        self.hourly_calls += 1
+        return {}
+
+    async def async_get_daily(self, start, last_day, periods=None):
+        return {dt.datetime(2026, 11, 12): {"kwh": 40.0, "cost": 7.1},
+                dt.datetime(2026, 11, 13): {"kwh": 35.5, "cost": 6.4}}
+
+
+async def _run_import():
+    pushed = []
+    gcoord.async_add_external_statistics = lambda hass, meta, rows: pushed.append(
+        (meta["statistic_id"], meta["name"], rows))
+    c = object.__new__(GaPowerCoordinator)
+    c.hass = type("H", (), {"config": type("C", (), {
+        "time_zone": "America/Chicago", "currency": "USD"})()})()
+    c.api = _HourlyEmptyApi()
+    c.data = None
+    c._daily_only = False
+    c._periods = [(D(2026, 11, 12), D(2026, 12, 14))]
+    c._cycle = c._periods[0]
+
+    async def _no_last(_sid):
+        return None
+
+    async def _cycle(_today):
+        return c._periods[0]
+
+    c._async_get_last = _no_last
+    c._async_current_cycle = _cycle
+    first = await c._async_import_statistics()
+    second = await c._async_import_statistics()
+    return c, first, second, pushed
+
+
+_c, _first, _second, _pushed = asyncio.run(_run_import())
+_usage = [p for p in _pushed if p[0].endswith("energy_consumption")][0]
+check("import: falls back to daily when hourly is empty", _first["resolution"], "daily")
+check("import: running kWh sum across days", [r["sum"] for r in _usage[2]], [40.0, 75.5])
+check("import: statistic named for Alabama Power", _usage[1],
+      "Alabama Power Energy Consumption")
+check("import: daily cycle kWh reported", _first["cycle_kwh"], 75.5)
+check("import: later polls skip the empty hourly request", _c.api.hourly_calls, 1)
+
 print("\n" + "=" * 58)
 print(str(OK) + " passed, " + str(FAIL) + " failed")
 sys.exit(1 if FAIL else 0)

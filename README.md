@@ -25,6 +25,18 @@ no add-ons. You sign in once with your utility account and Home Assistant does t
 > Gas service (Nicor) won't work — it isn't electric. See
 > [Other Southern Company utilities](#other-southern-company-utilities).
 
+> ## ✅ Alabama Power: daily data (this fork)
+>
+> Some Alabama Power accounts get **no hourly data** from the portal - the `/Hourly`
+> request answers `hasData: false` for every window, and the website itself offers only
+> Daily and Monthly. This fork (`gslamen/alapower-ha`) falls back to the portal's
+> **Daily** route automatically when hourly comes back empty: one row per day (placed at
+> local midnight) for kWh and cost, imported into the same Energy Dashboard statistics.
+> Daily cost is the actual daily charge, not a budget-billing amount.
+>
+> In daily mode the peak hour, demand charge and TOU-RD bill projection stay blank -
+> they need hourly readings and Georgia Power's tariff.
+
 ---
 
 ## What you get
